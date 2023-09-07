@@ -5,3 +5,6 @@ lm_cache
 .idea
 
 *.egg-info/
+
+# jkirchen launcher stuff
+log*/*
