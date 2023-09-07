@@ -74,14 +74,15 @@ def simple_evaluate(
         if model_args is None:
             model_args = ""
         lm = lm_eval.models.get_model(model).create_from_arg_string(
-            model_args, {"batch_size": batch_size, "max_batch_size": max_batch_size, "device": device}
+            model_args,
+            {"batch_size": batch_size, "max_batch_size": max_batch_size, "device": device},
         )
     elif isinstance(model, transformers.PreTrainedModel):
         lm = lm_eval.models.get_model("hf-causal")(
-                pretrained=model,
-                batch_size=batch_size,
-                max_batch_size=max_batch_size,
-                )
+            pretrained=model,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+        )
         no_cache = True
     else:
         assert isinstance(model, lm_eval.base.LM)
@@ -137,6 +138,68 @@ def simple_evaluate(
 
 
 decontaminate_suffix = "_decontaminate"
+
+###############################################################################
+# jwk: Going to inject paraphrase code here
+import openai
+import re
+from tqdm import tqdm
+import os
+
+openai.api_key = os.environ["OPENAI_API_KEY"]
+
+
+# https://github.com/jwkirchenbauer/lm-watermarking/blob/main/watermark_reliability_release/utils/attack.py
+def gpt_attack(
+    original_text,
+    paraphrase_prompt=None,
+    paraphrase_model_name=None,
+    paraphrase_temperature=None,
+    paraphrase_max_tokens=None,
+):
+    assert paraphrase_prompt, "Prompt must be provided for GPT attack"
+
+    attacker_query = paraphrase_prompt + original_text
+    query_msg = {"role": "user", "content": attacker_query}
+
+    from tenacity import retry, stop_after_attempt, wait_random_exponential
+
+    # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_handle_rate_limits.ipynb
+    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(100))
+    def completion_with_backoff(model, messages, temperature, max_tokens):
+        try:
+            res = openai.ChatCompletion.create(
+                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
+            )
+        except openai.error.InvalidRequestError as e:
+            if "Please reduce the length" in e._message:
+                assert len(messages) == 1
+                orig_input = messages[0]["content"]
+                print(f"Reducing length of input from {len(orig_input)} to {len(orig_input) // 2}")
+                messages[0]["content"] = orig_input[: len(orig_input) // 2]
+                res = openai.ChatCompletion.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            else:
+                raise e
+        return res
+
+    outputs = completion_with_backoff(
+        model=paraphrase_model_name,
+        messages=[query_msg],
+        temperature=paraphrase_temperature,
+        max_tokens=paraphrase_max_tokens,
+    )
+
+    attacked_text = outputs.choices[0].message.content
+
+    return attacked_text
+
+
+###############################################################################
 
 
 @positional_deprecated
@@ -254,6 +317,22 @@ def evaluate(
             ctx = task.fewshot_context(
                 doc=doc, num_fewshot=num_fewshot, rnd=rnd, description=description
             )
+
+            ##################################################################
+            if lm.paraphrase:
+                # jwk: changing here
+                # We will insert the paraphrase call here, and the thing we're paraphrasing is the prepared context/ctx
+                # will eventually propagate in a flag to turn this on and off
+                gpt_attack_kwargs = {
+                    "paraphrase_prompt": "paraphrase the following paragraphs:\n",
+                    "paraphrase_model_name": "gpt-3.5-turbo",
+                    "paraphrase_temperature": 0.7,
+                    # "paraphrase_max_tokens": 100,  # or 1000, I think 1.5x input length dynamically makes sense but hard to implement here
+                    "paraphrase_max_tokens": 2048,
+                }
+                ctx = gpt_attack(ctx, **gpt_attack_kwargs)
+            ##################################################################
+
             reqs = task.construct_requests(doc, ctx)
 
             if write_out:
@@ -287,9 +366,7 @@ def evaluate(
         from lm_eval.decontamination.decontaminate import get_train_overlap
 
         print("Finding train/test overlap, please wait...")
-        overlaps = get_train_overlap(
-            docs_for_decontamination, decontamination_ngrams_path, limit
-        )
+        overlaps = get_train_overlap(docs_for_decontamination, decontamination_ngrams_path, limit)
 
     # all responses for each (task, doc)
     process_res_queue = collections.defaultdict(list)
@@ -303,9 +380,7 @@ def evaluate(
 
         print("Running", reqtype, "requests")
         resps = getattr(lm, reqtype)([req.args for req in reqs])
-        resps = [
-            x if req.index is None else x[req.index] for x, req in zip(resps, reqs)
-        ]
+        resps = [x if req.index is None else x[req.index] for x, req in zip(resps, reqs)]
 
         for resp, (i, task_name, doc, doc_id) in zip(resps, requests_origin[reqtype]):
             process_res_queue[(task_name, doc_id)].append((i, resp))
@@ -316,9 +391,7 @@ def evaluate(
                 if isinstance(task, lm_eval.base.MultipleChoiceTask):
                     write_out_info[task_name][doc_id]["truth"] = doc["gold"]
                 elif isinstance(task, lm_eval.tasks.winogrande.Winogrande):
-                    write_out_info[task_name][doc_id]["truth"] = task.answer_to_num[
-                        doc["answer"]
-                    ]
+                    write_out_info[task_name][doc_id]["truth"] = task.answer_to_num[doc["answer"]]
                 else:
                     write_out_info[task_name][doc_id]["truth"] = task.doc_to_target(doc)
 
@@ -372,9 +445,7 @@ def evaluate(
         import pathlib
 
         output_base_path = (
-            pathlib.Path(output_base_path)
-            if output_base_path is not None
-            else pathlib.Path(".")
+            pathlib.Path(output_base_path) if output_base_path is not None else pathlib.Path(".")
         )
         try:
             output_base_path.mkdir(parents=True, exist_ok=False)

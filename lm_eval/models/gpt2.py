@@ -4,9 +4,7 @@ from typing import Optional, Union
 from lm_eval.base import BaseLM
 
 
-def _get_dtype(
-    dtype: Union[str, torch.dtype]
-) -> torch.dtype:
+def _get_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
     """Converts `dtype` from `str` to torch.dtype when possible. Does not use an instantiated HF AutoConfig"""
     if isinstance(dtype, str) and dtype != "auto":
         # Convert `str` args torch dtype: `float16` -> `torch.float16`
@@ -17,7 +15,6 @@ def _get_dtype(
 
 
 class HFLM(BaseLM):
-
     _DEFAULT_MAX_LENGTH = 2048
 
     def __init__(
@@ -25,6 +22,8 @@ class HFLM(BaseLM):
         device="cuda",
         pretrained="gpt2",
         revision="main",
+        broken_token=False,
+        paraphrase=False,
         low_cpu_mem_usage=None,
         subfolder=None,
         tokenizer=None,
@@ -33,36 +32,43 @@ class HFLM(BaseLM):
         max_length=None,
         load_in_8bit: Optional[bool] = False,
         trust_remote_code: Optional[bool] = False,
-        dtype: Optional[Union[str, torch.dtype]]="auto",
+        dtype: Optional[Union[str, torch.dtype]] = "auto",
     ):
         super().__init__()
 
+        self.broken_token = broken_token
+        if broken_token:
+            self.bpe_dropout = 0.4
+            print("Monkeypatch overwriting tokenizer calls")
+            self.tok_encode = self.brok_tok_encode
+            self._encode_pair = self._brok_tok_encode_pair
+        else:
+            self.bpe_dropout = None
+            print("Leaving original tokenizer calls as is")
+
+        self.paraphrase = paraphrase
+        print(f"Running paraphrase defense: {self.paraphrase}")
 
         # Initialize model
-        if isinstance(pretrained, transformers.PreTrainedModel):
-            self.model = pretrained
-            self._device = self.model.device
+        # if isinstance(pretrained, transformers.PreTrainedModel):
+        #     self.model = pretrained
+        #     self._device = self.model.device
 
-            if tokenizer:
-                assert isinstance(
-                        tokenizer,
-                        transformers.PreTrainedTokenizer
-                        ) or isinstance(
-                        tokenizer,
-                        transformers.PreTrainedTokenizerFast
-                        )
-                self.tokenizer = tokenizer
-            else:
-                # Get tokenizer
-                model_name = self.model.name_or_path
-                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                        model_name,
-                        revision=revision,
-                        trust_remote_code=trust_remote_code,
-                        )
+        #     if tokenizer:
+        #         assert isinstance(tokenizer, transformers.PreTrainedTokenizer) or isinstance(
+        #             tokenizer, transformers.PreTrainedTokenizerFast
+        #         )
+        #         self.tokenizer = tokenizer
+        #     else:
+        #         # Get tokenizer
+        #         model_name = self.model.name_or_path
+        #         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+        #             model_name,
+        #             revision=revision,
+        #             trust_remote_code=trust_remote_code,
+        #         )
 
-        elif isinstance(pretrained, str):
-
+        if isinstance(pretrained, str):
             # Initialize device
             assert isinstance(device, str)
             device_list = set(
@@ -75,29 +81,31 @@ class HFLM(BaseLM):
                 print("Device not specified")
                 print(f"Cuda Available? {torch.cuda.is_available()}")
                 self._device = (
-                    torch.device("cuda")
-                    if torch.cuda.is_available()
-                    else torch.device("cpu")
+                    torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
                 )
             revision = revision + ("/" + subfolder if subfolder is not None else "")
 
             # Initialize new model and tokenizer instances
             self.model = transformers.AutoModelForCausalLM.from_pretrained(
-                    pretrained,
-                    load_in_8bit=load_in_8bit,
-                    low_cpu_mem_usage=low_cpu_mem_usage,
-                    revision=revision,
-                    torch_dtype=_get_dtype(dtype),
-                    trust_remote_code=trust_remote_code,
-                    ).to(self.device)
+                pretrained,
+                load_in_8bit=load_in_8bit,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                revision=revision,
+                torch_dtype=_get_dtype(dtype),
+                trust_remote_code=trust_remote_code,
+            ).to(self.device)
+            print("Initializing tokenizer")
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    tokenizer if tokenizer else pretrained,
-                    revision=revision,
-                    trust_remote_code=trust_remote_code,
-                    )
+                tokenizer if tokenizer else pretrained,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                use_fast=False,  # default to False for now because doesn't play nicely with our custom encode
+            )
 
         else:
-            raise TypeError('Parameter pretrained should be of type str or transformers.PreTrainedModel')
+            raise TypeError(
+                "Parameter pretrained should be of type str or transformers.PreTrainedModel"
+            )
 
         self.model.eval()
 
@@ -124,7 +132,7 @@ class HFLM(BaseLM):
 
     @property
     def max_length(self):
-        if self._max_length: # if max length manually set, return it
+        if self._max_length:  # if max length manually set, return it
             return self._max_length
         seqlen_config_attrs = ("n_positions", "max_position_embeddings", "n_ctx")
         for attr in seqlen_config_attrs:
@@ -135,7 +143,6 @@ class HFLM(BaseLM):
                 return self._DEFAULT_MAX_LENGTH
             return self.tokenizer.model_max_length
         return self._DEFAULT_MAX_LENGTH
-
 
     @property
     def max_gen_toks(self):
@@ -152,7 +159,23 @@ class HFLM(BaseLM):
         return self._device
 
     def tok_encode(self, string: str):
+        # print("Calling original encode")
         return self.tokenizer.encode(string, add_special_tokens=False)
+
+    def brok_tok_encode(self, string: str, broken=True):
+        # print("Calling custom encode")
+        if not broken:
+            # equiv to self.tokenizer(string, add_special_tokens=False)["input_ids"]
+            return self.tokenizer.encode(string, add_special_tokens=False)
+        if "falcon" in self.model.name_or_path:
+            self.tokenizer._tokenizer.model.dropout = self.bpe_dropout
+            encoded = self.tokenizer(string, add_special_tokens=False).input_ids
+            self.tokenizer._tokenizer.model.dropout = 0
+        else:
+            encoded = self.tokenizer.sp_model.encode(
+                string, alpha=self.bpe_dropout, enable_sampling=True
+            )
+        return encoded
 
     def tok_decode(self, tokens):
         return self.tokenizer.decode(tokens)
@@ -171,8 +194,8 @@ class HFLM(BaseLM):
     def _model_generate(self, context, max_length, eos_token_id):
         generation_kwargs = {"do_sample": False, "max_length": max_length}
         if eos_token_id is not None:
-            generation_kwargs['eos_token_id'] = eos_token_id
-            generation_kwargs['pad_token_id'] = eos_token_id # setting eos_token_id as pad token
+            generation_kwargs["eos_token_id"] = eos_token_id
+            generation_kwargs["pad_token_id"] = eos_token_id  # setting eos_token_id as pad token
         return self.model.generate(context, **generation_kwargs)
 
 

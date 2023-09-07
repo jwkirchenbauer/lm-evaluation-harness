@@ -176,9 +176,7 @@ class BaseLM(LM):
     def _detect_batch_size(self, requests=None, pos=0):
         if requests:
             _, context_enc, continuation_enc = requests[pos]
-            max_length = len(
-                (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1]
-            )
+            max_length = len((context_enc + continuation_enc)[-(self.max_length + 1) :][:-1])
         else:
             max_length = self.max_length
 
@@ -209,14 +207,22 @@ class BaseLM(LM):
         continuation_enc = whole_enc[context_enc_len:]
         return context_enc, continuation_enc
 
+    def _brok_tok_encode_pair(self, context, continuation):
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+        # We just encode the two parts separately
+        context_enc = self.tok_encode(context)
+        continuation_enc = self.tok_encode(continuation)
+        return context_enc, continuation_enc
+
     def loglikelihood(self, requests):
         new_reqs = []
         for context, continuation in requests:
             if context == "":
                 # end of text as context
-                context_enc, continuation_enc = [self.eot_token_id], self.tok_encode(
-                    continuation
-                )
+                context_enc, continuation_enc = [self.eot_token_id], self.tok_encode(continuation)
             else:
                 context_enc, continuation_enc = self._encode_pair(context, continuation)
 
@@ -345,9 +351,7 @@ class BaseLM(LM):
                 cont = continuation_enc
 
                 # since in _collate we make sure length is descending, the longest is always the first one.
-                padding_length = (
-                    padding_length if padding_length is not None else inplen
-                )
+                padding_length = padding_length if padding_length is not None else inplen
 
                 # pad length from seq to padding_length
                 inp = torch.cat(
@@ -372,26 +376,21 @@ class BaseLM(LM):
             for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(
                 chunk, multi_logits, inps, inplens, cont_toks_list
             ):
-
                 # Slice to original seq length
                 contlen = len(cont_toks)
-                inplen = inplen + (logits.shape[0] - padding_length) # if "virtual tokens" (from prompt tuning) are added, inplen is larger
-                logits = logits[inplen - contlen : inplen].unsqueeze(
-                    0
-                )  # [1, seq, vocab]
+                inplen = inplen + (
+                    logits.shape[0] - padding_length
+                )  # if "virtual tokens" (from prompt tuning) are added, inplen is larger
+                logits = logits[inplen - contlen : inplen].unsqueeze(0)  # [1, seq, vocab]
 
                 # Check if per-token argmax is exactly equal to continuation
                 greedy_tokens = logits.argmax(dim=-1)
-                cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
-                    0
-                )  # [1, seq]
+                cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(0)  # [1, seq]
                 max_equal = (greedy_tokens == cont_toks).all()
 
                 # Obtain log-probs at the corresponding continuation token indices
                 # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
-                logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
-                    -1
-                )  # [1, seq]
+                logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
 
                 # Answer: (log prob, is-exact-match)
                 answer = (float(logits.sum()), bool(max_equal))
@@ -602,9 +601,7 @@ class Task(abc.ABC):
         return rnd.sample(self._training_docs, k)
 
     def doc_to_decontamination_query(self, doc):
-        print(
-            "Override doc_to_decontamination_query with document specific decontamination query."
-        )
+        print("Override doc_to_decontamination_query with document specific decontamination query.")
         assert False
 
     @abstractmethod
@@ -691,9 +688,7 @@ class Task(abc.ABC):
         :returns: str
             The fewshot context.
         """
-        assert (
-            rnd is not None
-        ), "A `random.Random` generator argument must be provided to `rnd`"
+        assert rnd is not None, "A `random.Random` generator argument must be provided to `rnd`"
         assert not provide_description, (
             "The `provide_description` arg will be removed in future versions. To prepend "
             "a custom description to the context, supply the corresponding string via the "
@@ -716,9 +711,7 @@ class Task(abc.ABC):
             else:
                 if self._fewshot_docs is None:
                     self._fewshot_docs = list(
-                        self.validation_docs()
-                        if self.has_validation_docs()
-                        else self.test_docs()
+                        self.validation_docs() if self.has_validation_docs() else self.test_docs()
                     )
 
                 fewshotex = rnd.sample(self._fewshot_docs, num_fewshot + 1)
@@ -727,12 +720,7 @@ class Task(abc.ABC):
                 fewshotex = [x for x in fewshotex if x != doc][:num_fewshot]
 
             labeled_examples = (
-                "\n\n".join(
-                    [
-                        self.doc_to_text(doc) + self.doc_to_target(doc)
-                        for doc in fewshotex
-                    ]
-                )
+                "\n\n".join([self.doc_to_text(doc) + self.doc_to_target(doc) for doc in fewshotex])
                 + "\n\n"
             )
 
@@ -745,9 +733,7 @@ class MultipleChoiceTask(Task):
         return " " + doc["choices"][doc["gold"]]
 
     def construct_requests(self, doc, ctx):
-        lls = [
-            rf.loglikelihood(ctx, " {}".format(choice))[0] for choice in doc["choices"]
-        ]
+        lls = [rf.loglikelihood(ctx, " {}".format(choice))[0] for choice in doc["choices"]]
 
         return lls
 
@@ -791,12 +777,8 @@ class PerplexityTask(Task, abc.ABC):
     def fewshot_context(
         self, doc, num_fewshot, provide_description=None, rnd=None, description=None
     ):
-        assert (
-            num_fewshot == 0
-        ), "The number of fewshot examples must be 0 for perplexity tasks."
-        assert (
-            rnd is not None
-        ), "A `random.Random` generator argument must be provided to `rnd`."
+        assert num_fewshot == 0, "The number of fewshot examples must be 0 for perplexity tasks."
+        assert rnd is not None, "A `random.Random` generator argument must be provided to `rnd`."
         assert not provide_description, (
             "The `provide_description` arg will be removed in future versions. To prepend "
             "a custom description to the context, supply the corresponding string via the "
