@@ -176,7 +176,8 @@ def gpt_attack(
                 assert len(messages) == 1
                 orig_input = messages[0]["content"]
                 print(f"Reducing length of input from {len(orig_input)} to {len(orig_input) // 2}")
-                messages[0]["content"] = orig_input[: len(orig_input) // 2]
+                # messages[0]["content"] = orig_input[: len(orig_input) // 2]
+                messages[0]["content"] = orig_input[len(orig_input) // 2 :]
                 res = openai.ChatCompletion.create(
                     model=model,
                     messages=messages,
@@ -307,7 +308,12 @@ def evaluate(
         if limit is not None:
             limit = int(len(task_docs) * limit) if limit < 1.0 else int(limit)
 
-        for doc_id, doc in enumerate(itertools.islice(task_docs, 0, limit)):
+        # for doc_id, doc in enumerate(itertools.islice(task_docs, 0, limit)):
+        for doc_id, doc in tqdm(
+            enumerate(itertools.islice(task_docs, 0, limit)),
+            total=limit,
+            desc=f"Prepping docs for {task_name}",
+        ):
             if decontaminate and task.should_decontaminate():
                 docs_for_decontamination[(task_name, task_set)].append(
                     task.doc_to_decontamination_query(doc)
@@ -397,6 +403,8 @@ def evaluate(
 
     vals = collections.defaultdict(list)
 
+    print(f"Applying ppl filter: {lm.ppl_filter}, filter_instance: {lm.ppl_filter_instance}")
+
     # unpack results and sort back in order and return control to Task
     for (task_name, doc_id), requests in process_res_queue.items():
         requests.sort(key=lambda x: x[0])
@@ -406,6 +414,12 @@ def evaluate(
         doc = docs[(task_name, doc_id)]
 
         metrics = task.process_results(doc, requests)
+
+        if lm.ppl_filter is not None:
+            query_ppls, passed_flags = lm.ppl_filter_instance.filter([task.doc_to_text(doc)])
+            metrics["query_ppl"] = query_ppls[0]  # these are lists but we always pass 1 query
+            metrics["passed_filter"] = passed_flags[0]
+
         for metric, value in metrics.items():
             vals[(task_name, metric)].append(value)
 
@@ -417,6 +431,8 @@ def evaluate(
                 if doc_id not in overlaps[task_name]:
                     vals[(task_name, metric + decontaminate_suffix)].append(value)
 
+    metric_item_series = {}
+
     # aggregate results
     for (task_name, metric), items in vals.items():
         task = task_dict[task_name]
@@ -425,7 +441,18 @@ def evaluate(
             real_metric = metric.replace(
                 decontaminate_suffix, ""
             )  # decontaminated still uses the same metric
-        results[task_name][metric] = task.aggregation()[real_metric](items)
+
+        if metric == "query_ppl":
+            results[task_name][metric] = np.mean(items)
+            continue
+        elif metric == "passed_filter":
+            results[task_name][metric] = np.mean(items)
+            # Store the filter flag series for later use
+            metric_item_series[(task_name, metric)] = items
+            continue
+        else:
+            # default behavior
+            results[task_name][metric] = task.aggregation()[real_metric](items)
 
         # hotfix: bleu, chrf, ter seem to be really expensive to bootstrap
         # so we run them less iterations. still looking for a cleaner way to do this
@@ -439,6 +466,37 @@ def evaluate(
 
         if stderr is not None:
             results[task_name][metric + "_stderr"] = stderr(items)
+
+    # Now compute the filter conditional variant of each existing metric
+    for (task_name, metric), items in vals.items():
+        task = task_dict[task_name]
+        real_metric = metric  # key when looking up the metric with task.aggregation
+        if metric.endswith(decontaminate_suffix):
+            real_metric = metric.replace(
+                decontaminate_suffix, ""
+            )  # decontaminated still uses the same metric
+        if metric != "passed_filter" and ((task_name, "passed_filter") in metric_item_series):
+            filter_series = metric_item_series[(task_name, "passed_filter")]
+            filter_passed_items = [item for item, passed in zip(items, filter_series) if passed]
+            didnt_pass_filter_items = [
+                item for item, passed in zip(items, filter_series) if not passed
+            ]
+            if metric == "query_ppl":
+                agg_fn = np.mean
+            else:
+                agg_fn = task.aggregation()[real_metric]
+
+            if len(filter_passed_items) == 0:
+                results[task_name][metric + "_passed_filter"] = np.nan
+            else:
+                results[task_name][metric + "_passed_filter"] = agg_fn(filter_passed_items)
+            if len(didnt_pass_filter_items) == 0:
+                results[task_name][metric + "_didnt_pass_filter"] = np.nan
+            else:
+                results[task_name][metric + "_didnt_pass_filter"] = agg_fn(didnt_pass_filter_items)
+            results[task_name]["num_total"] = len(items)
+            results[task_name]["num_passed_filter"] = len(filter_passed_items)
+            results[task_name]["num_didnt_pass_filter"] = len(didnt_pass_filter_items)
 
     if write_out:
         import json

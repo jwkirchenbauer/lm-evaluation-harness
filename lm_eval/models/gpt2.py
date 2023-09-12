@@ -3,6 +3,8 @@ import transformers
 from typing import Optional, Union
 from lm_eval.base import BaseLM
 
+from lm_eval.perplexity_filter import PerplexityFilter
+
 
 def _get_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
     """Converts `dtype` from `str` to torch.dtype when possible. Does not use an instantiated HF AutoConfig"""
@@ -24,6 +26,7 @@ class HFLM(BaseLM):
         revision="main",
         broken_token=False,
         paraphrase=False,
+        ppl_filter=None,
         low_cpu_mem_usage=None,
         subfolder=None,
         tokenizer=None,
@@ -48,6 +51,9 @@ class HFLM(BaseLM):
 
         self.paraphrase = paraphrase
         print(f"Running paraphrase defense: {self.paraphrase}")
+
+        self.ppl_filter = ppl_filter
+        print(f"Applying ppl filter: {self.ppl_filter}")
 
         # Initialize model
         # if isinstance(pretrained, transformers.PreTrainedModel):
@@ -94,6 +100,7 @@ class HFLM(BaseLM):
                 torch_dtype=_get_dtype(dtype),
                 trust_remote_code=trust_remote_code,
             ).to(self.device)
+            print(f"Model dtype: {self.model.dtype}")
             print("Initializing tokenizer")
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 tokenizer if tokenizer else pretrained,
@@ -124,6 +131,14 @@ class HFLM(BaseLM):
         self.max_batch_size = max_batch_size
 
         self._max_length = max_length
+
+        # setup ppl filter
+        if self.ppl_filter:
+            self.ppl_filter_instance = PerplexityFilter(
+                self.model, self.tokenizer, threshold=self.ppl_filter
+            )
+        else:
+            self.ppl_filter_instance = None
 
     @property
     def eot_token_id(self):
